@@ -13,43 +13,34 @@ const columns = [
   "编码纠错",
   "敏感词脱敏"
 ]
-const actions = [
-  "提交规则验证",
-  "启用规则",
-  "废弃规则"
-]
-const statuses = [
-  "草稿",
-  "规则验证中",
-  "已启用",
-  "已废弃"
-]
-const stats = [
-  {
-    "label": "去噪规则总数",
-    "value": 0
-  },
-  {
-    "label": "已启用规则",
-    "value": 0
-  },
-  {
-    "label": "验证中规则",
-    "value": 0
-  }
-]
+// 状态机：每个状态只暴露可执行的动作入口，与后端单向推进保持一致
+const ACTIONS_BY_STATUS: Record<string, string[]> = {
+  "草稿": ["提交规则验证"],
+  "规则验证中": ["启用规则"],
+  "已启用": ["废弃规则"],
+  "已废弃": []
+}
 
 type Row = Record<string, string | number | null>
+type Fingerprint = {
+  指纹编号: string
+  引擎编号: string
+  字段组版本: number
+  指纹状态: string
+  退出原因: string
+}
+type Detail = Row & { 引用指纹?: Fingerprint[] }
+type Feedback = { ok: boolean; text: string }
 
 export default function DatacleanView() {
   const [rows, setRows] = useState<Row[]>([])
   const [total, setTotal] = useState(0)
-  const [errorMessage, setErrorMessage] = useState('')
+  const [feedback, setFeedback] = useState<Feedback | null>(null)
   const [filters, setFilters] = useState<Record<string, string>>({})
+  const [detail, setDetail] = useState<Detail | null>(null)
   const filterFields = useMemo(() => columns.slice(0, 3), [])
 
   const reload = useCallback(async () => {
-    setErrorMessage('')
     const query = new URLSearchParams(filters).toString()
     try {
       const response = await request(`${ENDPOINT}?${query}`)
@@ -60,7 +51,7 @@ export default function DatacleanView() {
       setRows(payload.items ?? [])
       setTotal(payload.total ?? 0)
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '数据去噪列表读取失败')
+      setFeedback({ ok: false, text: error instanceof Error ? error.message : '数据去噪列表读取失败' })
     }
   }, [filters])
 
@@ -68,19 +59,43 @@ export default function DatacleanView() {
     void reload()
   }, [reload])
 
+  // 工作台统计与列表同一份数据，避免对不上
+  const stats = useMemo(() => [
+    { label: '去噪规则总数', value: total },
+    { label: '已启用规则', value: rows.filter((row) => row.status === '已启用').length },
+    { label: '验证中规则', value: rows.filter((row) => row.status === '规则验证中').length },
+  ], [rows, total])
+
   async function runAction(action: string, row: Row) {
-    setErrorMessage('')
+    setFeedback(null)
     try {
       const response = await request(`${ENDPOINT}/${row.id}/actions`, {
         method: 'POST',
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ values: { action } }),
       })
-      if (!response.ok) {
-        throw new Error('数据去噪动作未生效，请稍后重试')
-      }
+      const payload = await response.json()
+      setFeedback({ ok: Boolean(payload.ok), text: String(payload.message ?? '') })
+      setDetail(null) // 状态已流转，关掉旧详情避免残留旧值
       await reload()
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '数据去噪操作失败')
+      setFeedback({ ok: false, text: error instanceof Error ? error.message : '数据去噪操作失败' })
+    }
+  }
+
+  async function openDetail(row: Row) {
+    setFeedback(null)
+    if (detail && detail.id === row.id) {
+      setDetail(null)
+      return
+    }
+    try {
+      const response = await request(`${ENDPOINT}/${row.id}`)
+      if (!response.ok) {
+        throw new Error('去噪规则详情读取失败')
+      }
+      setDetail((await response.json()) as Detail)
+    } catch (error) {
+      setFeedback({ ok: false, text: error instanceof Error ? error.message : '去噪规则详情读取失败' })
     }
   }
 
@@ -89,10 +104,10 @@ export default function DatacleanView() {
       <header className="page-head">
         <div>
           <h2>数据去噪管理</h2>
-          <p className="page-desc">管理采集后数据的去噪清洗规则，包括HTML标签移除、特殊字符过滤和编码纠错。</p>
+          <p className="page-desc">管理采集后数据的去噪清洗规则，包括HTML标签移除、特殊字符过滤和编码纠错。废弃规则会让引用它的去重指纹退出新接入，历史判定保留。</p>
         </div>
         <div className="page-actions">
-          <button className="btn primary" type="button" onClick={() => setErrorMessage('去噪规则登记入口尚未接入审批流')}>
+          <button className="btn primary" type="button" onClick={() => setFeedback({ ok: false, text: '去噪规则登记入口尚未接入审批流' })}>
             登记去噪规则
           </button>
           <button className="btn" type="button" onClick={() => window.open(`${ENDPOINT}/export`, '_blank')}>
@@ -129,25 +144,58 @@ export default function DatacleanView() {
         <thead>
           <tr>
             {columns.map((column) => <th key={column}>{column}</th>)}
+            <th>状态</th>
             <th>可执行动作</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
-            <tr key={String(row.id)}>
-              {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
-              <td className="row-actions">
-                {actions.map((action) => (
-                  <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
-                    {action}
+          {rows.map((row) => {
+            const status = String(row.status ?? '')
+            const availableActions = ACTIONS_BY_STATUS[status] ?? []
+            const isOpen = detail !== null && detail.id === row.id
+            return [
+              <tr key={String(row.id)}>
+                {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
+                <td>{status || '—'}</td>
+                <td className="row-actions">
+                  {availableActions.map((action) => (
+                    <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
+                      {action}
+                    </button>
+                  ))}
+                  {availableActions.length === 0 && <span className="muted">终态，无可用动作</span>}
+                  <button className="link" type="button" onClick={() => void openDetail(row)}>
+                    {isOpen ? '收起详情' : '详情'}
                   </button>
-                ))}
-              </td>
-            </tr>
-          ))}
+                </td>
+              </tr>,
+              isOpen && (
+                <tr key={`${String(row.id)}-detail`}>
+                  <td colSpan={columns.length + 2}>
+                    <div className="detail-panel">
+                      <p>规则编号：{String(detail.规则编号 ?? '—')} ｜ 状态：{String(detail.status ?? '—')}</p>
+                      <p>引用本规则的去重指纹（共 {detail.引用指纹?.length ?? 0} 条）：</p>
+                      {detail.引用指纹 && detail.引用指纹.length > 0 ? (
+                        <ul>
+                          {detail.引用指纹.map((fp) => (
+                            <li key={fp.指纹编号}>
+                              {fp.指纹编号}（引擎 {fp.引擎编号}，v{fp.字段组版本}）：{fp.指纹状态}
+                              {fp.退出原因 ? ` ｜ ${fp.退出原因}` : ''}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="muted">暂无去重指纹引用该规则</p>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ),
+            ]
+          })}
           {rows.length === 0 && (
             <tr>
-              <td className="empty-state" colSpan={columns.length + 1}>暂无数据去噪数据，可先登记去噪规则</td>
+              <td className="empty-state" colSpan={columns.length + 2}>暂无数据去噪数据，可先登记去噪规则</td>
             </tr>
           )}
         </tbody>
@@ -155,7 +203,7 @@ export default function DatacleanView() {
 
       <footer className="page-foot">
         <span>共 {total} 条数据去噪记录</span>
-        {errorMessage && <span className="error-text">{errorMessage}</span>}
+        {feedback && <span className={feedback.ok ? 'ok-text' : 'error-text'}>{feedback.text}</span>}
       </footer>
     </section>
   )

@@ -50,12 +50,16 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条去重引擎执行提交引擎评估、启用引擎、停用引擎；不允许的动作会被拦下并说明原因。"""
+    """对单条去重引擎执行提交引擎评估、启用引擎、停用引擎；不允许的动作会被拦下并说明原因。
+
+    重新启用时 values 里必须带「字段组版本」（大于当前版本），可顺带换绑「绑定清洗规则」；
+    缺版本时 extra.need_version=true 并回传当前版本号，前端据此补录。
+    """
     action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+    entry, message, extra = service.run_action(entry_id, action, payload.values)
     if entry is None:
-        return ActionResult(ok=False, message=message)
-    return ActionResult(ok=True, message=message, entry=entry)
+        return ActionResult(ok=False, message=message, extra=extra)
+    return ActionResult(ok=True, message=message, entry=entry, extra=extra)
 
 
 @router.get("/export")

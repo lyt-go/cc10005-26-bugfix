@@ -19,6 +19,8 @@ class ActionResult(BaseModel):
     ok: bool
     message: str
     entry: dict[str, Any] | None = None
+    # 结构化联动结果：受影响的去重引擎/指纹列表、需补版本号等，供前端直接渲染
+    extra: dict[str, Any] | None = None
 
 
 class EntryPayload(BaseModel):
